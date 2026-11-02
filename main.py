@@ -1,156 +1,192 @@
-
 import asyncio
 import logging
-import re
+import os
+from datetime import datetime
+
 import aiosqlite
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
-    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
+    Message, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# ==================================================
-# 1. SOZLAMALAR — O'ZINGIZ TO'LDIRING
-# ==================================================
-BOT_TOKEN = "8906936395:AAG3UL1jDR7Nz0czP-vyB1SfE4t5nsFp-dE"
-ADMIN_ID = 5200398952  # O'Z TELEGRAM IDINGIZNI YOZING
+# ==========================================
+# SOZLAMALAR
+# ==========================================
 
+BOT_TOKEN = os.getenv("9218262379:AAFsjhnY240_g_rxQrF8IXwvX9KkZNdMXao", "9218262379:AAFsjhnY240_g_rxQrF8IXwvX9KkZNdMXao")
+ADMIN_ID = int(os.getenv("5200398952", "5200398952"))
 DB_NAME = "bot_database.db"
-DEFAULT_REFERRAL_STARS = 2
-GIFT_OPTIONS = [15, 25, 50, 100]
+PORT = int(os.getenv("PORT", "10000"))
+
+REFERRAL_REWARD = 2
+GIFTS = [15, 25, 50, 100]
 
 logging.basicConfig(level=logging.INFO)
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN kiritilmagan!")
+
 bot = Bot(
-    token=BOT_TOKEN,
+    BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
+
 dp = Dispatcher()
 
-# Vaqtinchalik jarayonlar. Asosiy ma'lumotlar SQLite'da saqlanadi.
+# Vaqtinchalik jarayonlar
 flows = {}
-broadcasts = {}
 
 
-# ==================================================
-# 2. BAZA
-# ==================================================
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            full_name TEXT DEFAULT '',
-            balance INTEGER DEFAULT 0,
-            referrer_id INTEGER DEFAULT NULL,
-            banned INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
+# ==========================================
+# DATABASE
+# ==========================================
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            invited_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            reward INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1
-        )""")
+async def db(sql, params=(), one=False, all=False):
+    async with aiosqlite.connect(DB_NAME) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute(sql, params)
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            gift INTEGER NOT NULL,
-            status TEXT DEFAULT 'Kutilmoqda',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            username TEXT PRIMARY KEY,
-            mandatory INTEGER DEFAULT 1,
-            ads INTEGER DEFAULT 1
-        )""")
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-
-        await db.execute("""
-        INSERT OR IGNORE INTO settings(key, value)
-        VALUES ('referral_reward', '2')
-        """)
-
-        await db.commit()
-
-
-async def query(sql, params=(), fetchone=False, fetchall=False):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(sql, params)
         result = None
-        if fetchone:
-            row = await cursor.fetchone()
+
+        if one:
+            row = await cur.fetchone()
             result = dict(row) if row else None
-        elif fetchall:
-            rows = await cursor.fetchall()
-            result = [dict(r) for r in rows]
-        await db.commit()
+
+        if all:
+            rows = await cur.fetchall()
+            result = [dict(x) for x in rows]
+
+        await con.commit()
         return result
 
 
-async def get_user(user_id):
-    return await query(
-        "SELECT * FROM users WHERE user_id=?",
-        (user_id,), fetchone=True
-    )
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as con:
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            balance INTEGER DEFAULT 0,
+            referrer INTEGER,
+            banned INTEGER DEFAULT 0,
+            joined TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS referrals(
+            invited INTEGER PRIMARY KEY,
+            referrer INTEGER,
+            reward INTEGER,
+            created TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            gift INTEGER,
+            status TEXT DEFAULT 'Kutilmoqda',
+            created TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS channels(
+            username TEXT PRIMARY KEY,
+            mandatory INTEGER DEFAULT 1,
+            ads INTEGER DEFAULT 1
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            reason TEXT,
+            created TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        await con.execute("""
+        INSERT OR IGNORE INTO settings(key,value)
+        VALUES('referral_reward','2')
+        """)
+
+        await con.commit()
 
 
-async def get_setting(key, default=""):
-    row = await query(
+async def setting(key, default=""):
+    result = await db(
         "SELECT value FROM settings WHERE key=?",
-        (key,), fetchone=True
+        (key,), one=True
     )
-    return row["value"] if row else default
+    return result["value"] if result else default
 
 
-async def is_admin(user_id):
+async def get_user(user_id):
+    return await db(
+        "SELECT * FROM users WHERE user_id=?",
+        (user_id,), one=True
+    )
+
+
+async def register(user):
+    await db("""
+    INSERT OR IGNORE INTO users(user_id,username,name)
+    VALUES(?,?,?)
+    """, (user.id, user.username or "", user.full_name))
+
+    await db("""
+    UPDATE users SET username=?,name=? WHERE user_id=?
+    """, (user.username or "", user.full_name, user.id))
+
+
+def admin(user_id):
     return user_id == ADMIN_ID
 
 
-async def register_user(user):
-    await query("""
-        INSERT OR IGNORE INTO users(user_id, username, full_name)
-        VALUES (?, ?, ?)
-    """, (
-        user.id,
-        user.username or "",
-        user.full_name or ""
-    ))
-    await query("""
-        UPDATE users SET username=?, full_name=? WHERE user_id=?
-    """, (user.username or "", user.full_name or "", user.id))
+# ==========================================
+# MENYULAR
+# ==========================================
 
-
-# ==================================================
-# 3. TUGMALAR
-# ==================================================
 def user_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👥 Referal"),
-             KeyboardButton(text="💬 Adminga murojaat")],
-            [KeyboardButton(text="🎁 Gift yechish"),
-             KeyboardButton(text="💰 Mening hisobim")],
-            [KeyboardButton(text="📖 Qo'llanma"),
-             KeyboardButton(text="📦 Mening buyurtmalarim")]
+            [
+                KeyboardButton(text="👥 Referal"),
+                KeyboardButton(text="💰 Mening hisobim")
+            ],
+            [
+                KeyboardButton(text="🎁 Gift yechish"),
+                KeyboardButton(text="📦 Mening buyurtmalarim")
+            ],
+            [
+                KeyboardButton(text="💬 Adminga murojaat"),
+                KeyboardButton(text="🏆 Reyting")
+            ],
+            [
+                KeyboardButton(text="📜 Tarix"),
+                KeyboardButton(text="📖 Qo'llanma")
+            ]
         ],
         resize_keyboard=True
     )
@@ -159,1031 +195,1136 @@ def user_menu():
 def admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📦 Buyurtmalar"),
-             KeyboardButton(text="👤 Foydalanuvchilar")],
-            [KeyboardButton(text="📣 Hammaga xabar"),
-             KeyboardButton(text="📢 Kanallarga reklama")],
-            [KeyboardButton(text="📡 Majburiy kanallar"),
-             KeyboardButton(text="⚙️ Referal mukofoti")],
-            [KeyboardButton(text="📊 Statistika"),
-             KeyboardButton(text="🔎 ID bo'yicha foydalanuvchi")],
-            [KeyboardButton(text="⬅️ Foydalanuvchi paneli")]
+            [
+                KeyboardButton(text="📊 Statistika"),
+                KeyboardButton(text="👥 Foydalanuvchilar")
+            ],
+            [
+                KeyboardButton(text="📦 Buyurtmalar"),
+                KeyboardButton(text="📣 Hammaga xabar")
+            ],
+            [
+                KeyboardButton(text="📢 Reklama kanallari"),
+                KeyboardButton(text="📡 Majburiy kanallar")
+            ],
+            [
+                KeyboardButton(text="⚙️ Referal sozlamasi"),
+                KeyboardButton(text="💳 Balans boshqaruvi")
+            ],
+            [
+                KeyboardButton(text="🔎 ID qidirish"),
+                KeyboardButton(text="⬅️ Foydalanuvchi paneli")
+            ]
         ],
         resize_keyboard=True
     )
 
 
-def channel_keyboard(channels):
-    rows = []
-    for ch in channels:
-        username = ch["username"].lstrip("@")
-        rows.append([InlineKeyboardButton(
-            text=f"📢 @{username}",
-            url=f"https://t.me/{username}"
-        )])
-    rows.append([InlineKeyboardButton(
-        text="✅ Obunani tekshirish",
-        callback_data="check_subs"
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def gift_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🎁 {gift} gift",
-            callback_data=f"gift:{gift}"
-        )] for gift in GIFT_OPTIONS
-    ] + [[InlineKeyboardButton(
-        text="❌ Bekor qilish", callback_data="cancel"
-    )]])
-
-
-def confirm_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
+def gifts_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🎁 {x} Stars",
+                    callback_data=f"gift:{x}"
+                )
+            ]
+            for x in GIFTS
+        ] + [[
             InlineKeyboardButton(
-                text="✅ Tasdiqlash", callback_data="gift_confirm"
-            ),
-            InlineKeyboardButton(
-                text="❌ Bekor qilish", callback_data="cancel"
+                text="❌ Bekor qilish",
+                callback_data="cancel"
             )
-        ]
+        ]]
     ])
 
 
-# ==================================================
-# 4. MAJBURIY OBUNA
-# ==================================================
-async def get_mandatory_channels():
-    return await query(
+# ==========================================
+# MAJBURIY OBUNA
+# ==========================================
+
+async def channels():
+    return await db(
         "SELECT * FROM channels WHERE mandatory=1",
-        fetchall=True
+        all=True
     )
 
 
-async def missing_channels(user_id):
-    missing = []
-    for ch in await get_mandatory_channels():
+async def missing(user_id):
+    result = []
+
+    for ch in await channels():
         try:
-            member = await bot.get_chat_member(ch["username"], user_id)
+            member = await bot.get_chat_member(
+                ch["username"], user_id
+            )
+
             if member.status in (
-                ChatMemberStatus.LEFT, ChatMemberStatus.KICKED
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.KICKED
             ):
-                missing.append(ch)
+                result.append(ch)
+
         except Exception:
-            # Kanal sozlamasi noto'g'ri bo'lsa ham tekshiruv o'tmaydi.
-            missing.append(ch)
-    return missing
+            result.append(ch)
+
+    return result
 
 
-async def subscription_gate(message_or_callback, user_id):
-    missing = await missing_channels(user_id)
-    if not missing:
+async def check_subscription(message, user_id):
+    missing_channels = await missing(user_id)
+
+    if not missing_channels:
         return True
 
-    text = (
-        "🔒 <b>Botdan foydalanish uchun barcha majburiy "
-        "kanallarga obuna bo'ling.</b>\n\n"
-        "Obuna bo'lgach, «Obunani tekshirish» tugmasini bosing."
-    )
-    markup = channel_keyboard(missing)
+    rows = []
 
-    if isinstance(message_or_callback, Message):
-        await message_or_callback.answer(text, reply_markup=markup)
-    else:
-        await message_or_callback.message.answer(
-            text, reply_markup=markup
+    for ch in missing_channels:
+        username = ch["username"].lstrip("@")
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📢 {ch['username']}",
+                url=f"https://t.me/{username}"
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="✅ Tekshirish",
+            callback_data="check_subs"
         )
-        await message_or_callback.answer()
+    ])
+
+    await message.answer(
+        "🔒 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
     return False
 
 
-# ==================================================
-# 5. START VA REFERAL
-# ==================================================
+# ==========================================
+# REFERAL MUKOFOTI
+# ==========================================
+
+async def award_referral(user_id):
+    user = await get_user(user_id)
+
+    if not user or not user["referrer"]:
+        return
+
+    referrer = user["referrer"]
+
+    if await db(
+        "SELECT invited FROM referrals WHERE invited=?",
+        (user_id,), one=True
+    ):
+        return
+
+    if await missing(user_id):
+        return
+
+    reward = int(await setting("referral_reward", "2"))
+
+    async with aiosqlite.connect(DB_NAME) as con:
+        await con.execute("BEGIN IMMEDIATE")
+
+        cur = await con.execute("""
+        INSERT OR IGNORE INTO referrals(invited,referrer,reward)
+        VALUES(?,?,?)
+        """, (user_id, referrer, reward))
+
+        if cur.rowcount:
+            await con.execute("""
+            UPDATE users SET balance=balance+?
+            WHERE user_id=?
+            """, (reward, referrer))
+
+            await con.execute("""
+            INSERT INTO transactions(user_id,amount,reason)
+            VALUES(?,?,?)
+            """, (referrer, reward, "Referal mukofoti"))
+
+        await con.commit()
+
+    await bot.send_message(
+        referrer,
+        f"🎉 Yangi referalingiz tasdiqlandi!\n⭐ +{reward} Stars"
+    )
+
+
+# ==========================================
+# START
+# ==========================================
+
 @dp.message(CommandStart())
 async def start(message: Message):
     user = message.from_user
-    await register_user(user)
 
-    record = await get_user(user.id)
-    if record["banned"]:
-        await message.answer("⛔ Siz botdan foydalanishdan cheklangansiz.")
+    await register(user)
+
+    data = await get_user(user.id)
+
+    if data["banned"]:
+        await message.answer("⛔ Siz bloklangansiz.")
         return
 
-    # Faqat birinchi ro'yxatdan o'tishda referal qabul qilinadi.
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) == 2 and record["referrer_id"] is None:
-        arg = parts[1].strip()
+
+    if len(parts) == 2 and not data["referrer"]:
+        arg = parts[1]
+
         if arg.startswith("ref_") and arg[4:].isdigit():
-            referrer_id = int(arg[4:])
-            if referrer_id != user.id and await get_user(referrer_id):
-                await query(
-                    "UPDATE users SET referrer_id=? WHERE user_id=?",
-                    (referrer_id, user.id)
+            referrer = int(arg[4:])
+
+            if referrer != user.id and await get_user(referrer):
+                await db(
+                    "UPDATE users SET referrer=? WHERE user_id=?",
+                    (referrer, user.id)
                 )
 
-    if not await subscription_gate(message, user.id):
+    if not await check_subscription(message, user.id):
         return
 
-    if await is_admin(user.id):
-        await message.answer(
-            "🛠 <b>Admin paneliga xush kelibsiz!</b>",
-            reply_markup=admin_menu()
-        )
-    else:
-        await message.answer(
-            "👋 Xush kelibsiz!\nQuyidagi menyudan foydalaning.",
-            reply_markup=user_menu()
-        )
+    await award_referral(user.id)
+
+    await message.answer(
+        "👋 <b>Assalomu alaykum!</b>\n\n"
+        "Stars yig'ish botiga xush kelibsiz!",
+        reply_markup=admin_menu() if admin(user.id) else user_menu()
+    )
 
 
 @dp.callback_query(F.data == "check_subs")
 async def check_subs(callback: CallbackQuery):
-    user = await get_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Avval /start bosing.", show_alert=True)
-        return
-    if user["banned"]:
-        await callback.answer("Siz bloklangansiz.", show_alert=True)
-        return
+    if await check_subscription(
+        callback.message, callback.from_user.id
+    ):
+        await award_referral(callback.from_user.id)
 
-    if await subscription_gate(callback, callback.from_user.id):
         await callback.message.answer(
             "✅ Obuna tasdiqlandi!",
-            reply_markup=admin_menu() if await is_admin(
-                callback.from_user.id
-            ) else user_menu()
+            reply_markup=admin_menu()
+            if admin(callback.from_user.id)
+            else user_menu()
         )
-        await callback.answer("Tayyor!")
     else:
-        await callback.answer("Hali barcha kanallarga obuna emassiz.")
+        await callback.answer(
+            "Hali barcha kanallarga obuna emassiz!",
+            show_alert=True
+        )
+        return
+
+    await callback.answer()
 
 
-# ==================================================
-# 6. REFERAL PANELI
-# ==================================================
+# ==========================================
+# REFERAL
+# ==========================================
+
 @dp.message(F.text == "👥 Referal")
-async def referral_panel(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
+async def referral(message: Message):
+    if not await check_subscription(message, message.from_user.id):
         return
 
     me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
 
-    count = await query(
-        "SELECT COUNT(*) AS n FROM referrals "
-        "WHERE referrer_id=? AND active=1",
-        (message.from_user.id,), fetchone=True
+    link = (
+        f"https://t.me/{me.username}"
+        f"?start=ref_{message.from_user.id}"
     )
-    reward = await get_setting("referral_reward", "5")
+
+    count = await db(
+        "SELECT COUNT(*) AS n FROM referrals WHERE referrer=?",
+        (message.from_user.id,), one=True
+    )
+
     user = await get_user(message.from_user.id)
 
+    reward = await setting("referral_reward", "2")
+
     await message.answer(
-        "👥 <b>Sizning referal panelingiz</b>\n\n"
-        f"🔗 Taklif havolangiz:\n<code>{link}</code>\n\n"
-        f"✅ Faol referallar: {count['n']}\n"
-        f"⭐ Har bir referal uchun: {reward} Stars\n"
-        f"💰 Joriy balans: {user['balance']} Stars\n\n"
-        "Havolani do'stlaringizga yuboring. Mukofot faqat "
-        "yangi foydalanuvchi botga birinchi marta kirganda beriladi."
+        "👥 <b>REFERAL PANELI</b>\n\n"
+        f"🔗 Havolangiz:\n<code>{link}</code>\n\n"
+        f"👥 Referallar: {count['n']}\n"
+        f"⭐ Har bir referal: {reward} Stars\n"
+        f"💰 Balansingiz: {user['balance']} Stars"
     )
 
 
-# ==================================================
-# 7. HISOB VA QO'LLANMA
-# ==================================================
+# ==========================================
+# BALANS
+# ==========================================
+
 @dp.message(F.text == "💰 Mening hisobim")
-async def my_balance(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
+async def balance(message: Message):
+    if not await check_subscription(message, message.from_user.id):
         return
+
     user = await get_user(message.from_user.id)
-    refs = await query(
-        "SELECT COUNT(*) AS n FROM referrals "
-        "WHERE referrer_id=? AND active=1",
-        (message.from_user.id,), fetchone=True
-    )
-    await message.answer(
-        f"💰 <b>Mening hisobim</b>\n\n"
-        f"⭐ Stars: <b>{user['balance']}</b>\n"
-        f"👥 Faol referallar: {refs['n']}\n"
-        f"🆔 Sizning ID: <code>{message.from_user.id}</code>"
+
+    refs = await db(
+        "SELECT COUNT(*) AS n FROM referrals WHERE referrer=?",
+        (message.from_user.id,), one=True
     )
 
+    await message.answer(
+        "💰 <b>MENING HISOBIM</b>\n\n"
+        f"⭐ Balans: {user['balance']} Stars\n"
+        f"👥 Referallar: {refs['n']}\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>"
+    )
+
+
+# ==========================================
+# GIFT
+# ==========================================
+
+@dp.message(F.text == "🎁 Gift yechish")
+async def gift_menu(message: Message):
+    if not await check_subscription(message, message.from_user.id):
+        return
+
+    user = await get_user(message.from_user.id)
+
+    await message.answer(
+        f"🎁 Gift tanlang.\n"
+        f"Balans: {user['balance']} Stars",
+        reply_markup=gifts_keyboard()
+    )
+
+
+@dp.callback_query(F.data.startswith("gift:"))
+async def choose_gift(callback: CallbackQuery):
+    if not await check_subscription(
+        callback.message, callback.from_user.id
+    ):
+        await callback.answer()
+        return
+
+    gift = int(callback.data.split(":")[1])
+
+    if gift not in GIFTS:
+        await callback.answer("Noto'g'ri gift!", show_alert=True)
+        return
+
+    user = await get_user(callback.from_user.id)
+
+    if user["balance"] < gift:
+        await callback.answer(
+            "Balansingiz yetarli emas!",
+            show_alert=True
+        )
+        return
+
+    flows[callback.from_user.id] = {
+        "step": "gift",
+        "gift": gift
+    }
+
+    await callback.message.answer(
+        f"🎁 Tanlangan gift: {gift} Stars\n"
+        f"Qoladigan balans: {user['balance'] - gift}\n\n"
+        "Tasdiqlaysizmi?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Tasdiqlash",
+                    callback_data="gift_confirm"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish",
+                    callback_data="cancel"
+                )
+            ]]
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "gift_confirm")
+async def gift_confirm(callback: CallbackQuery):
+    data = flows.get(callback.from_user.id)
+
+    if not data or data.get("step") != "gift":
+        await callback.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+
+    gift = data["gift"]
+    uid = callback.from_user.id
+
+    async with aiosqlite.connect(DB_NAME) as con:
+        await con.execute("BEGIN IMMEDIATE")
+
+        cur = await con.execute(
+            "SELECT balance FROM users WHERE user_id=?",
+            (uid,)
+        )
+
+        row = await cur.fetchone()
+
+        if not row or row[0] < gift:
+            await con.rollback()
+            flows.pop(uid, None)
+            await callback.answer("Balans yetarli emas!", show_alert=True)
+            return
+
+        await con.execute(
+            "UPDATE users SET balance=balance-? WHERE user_id=?",
+            (gift, uid)
+        )
+
+        cur = await con.execute("""
+        INSERT INTO orders(user_id,gift)
+        VALUES(?,?)
+        """, (uid, gift))
+
+        order_id = cur.lastrowid
+
+        await con.execute("""
+        INSERT INTO transactions(user_id,amount,reason)
+        VALUES(?,?,?)
+        """, (uid, -gift, f"Gift buyurtmasi #{order_id}"))
+
+        await con.commit()
+
+    flows.pop(uid, None)
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"🛒 <b>YANGI BUYURTMA</b>\n\n"
+        f"Buyurtma: #{order_id}\n"
+        f"User: {uid}\n"
+        f"Gift: {gift} Stars\n\n"
+        f"/approve {order_id}\n"
+        f"/reject {order_id}"
+    )
+
+    await callback.message.answer(
+        f"✅ Buyurtma #{order_id} qabul qilindi.",
+        reply_markup=user_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel")
+async def cancel(callback: CallbackQuery):
+    flows.pop(callback.from_user.id, None)
+
+    await callback.message.answer(
+        "❌ Bekor qilindi.",
+        reply_markup=user_menu()
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# BUYURTMALAR
+# ==========================================
+
+@dp.message(F.text == "📦 Mening buyurtmalarim")
+async def my_orders(message: Message):
+    orders = await db(
+        "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 30",
+        (message.from_user.id,), all=True
+    )
+
+    if not orders:
+        await message.answer("Buyurtmalaringiz mavjud emas.")
+        return
+
+    text = "📦 <b>BUYURTMALARIM</b>\n\n"
+
+    for o in orders:
+        text += (
+            f"#{o['id']} — {o['gift']} Stars\n"
+            f"Holati: {o['status']}\n"
+            f"Sana: {o['created']}\n\n"
+        )
+
+    await message.answer(text)
+
+
+@dp.message(Command("approve"))
+async def approve(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    if not command.args or not command.args.isdigit():
+        await message.answer("/approve ORDER_ID")
+        return
+
+    oid = int(command.args)
+
+    async with aiosqlite.connect(DB_NAME) as con:
+        await con.execute("BEGIN IMMEDIATE")
+
+        cur = await con.execute(
+            "SELECT * FROM orders WHERE id=?", (oid,)
+        )
+        order = await cur.fetchone()
+
+        if not order or order[3] != "Kutilmoqda":
+            await con.rollback()
+            await message.answer("Buyurtma topilmadi yoki ko'rib chiqilgan.")
+            return
+
+        await con.execute(
+            "UPDATE orders SET status='Tasdiqlandi' WHERE id=?",
+            (oid,)
+        )
+
+        await con.commit()
+
+    await bot.send_message(
+        order[1],
+        f"✅ #{oid} buyurtmangiz tasdiqlandi!"
+    )
+
+    await message.answer("Buyurtma tasdiqlandi.")
+
+
+@dp.message(Command("reject"))
+async def reject(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    if not command.args or not command.args.isdigit():
+        await message.answer("/reject ORDER_ID")
+        return
+
+    oid = int(command.args)
+
+    async with aiosqlite.connect(DB_NAME) as con:
+        await con.execute("BEGIN IMMEDIATE")
+
+        cur = await con.execute(
+            "SELECT * FROM orders WHERE id=?", (oid,)
+        )
+        order = await cur.fetchone()
+
+        if not order or order[3] != "Kutilmoqda":
+            await con.rollback()
+            await message.answer("Buyurtma topilmadi.")
+            return
+
+        await con.execute(
+            "UPDATE orders SET status='Rad etildi' WHERE id=?",
+            (oid,)
+        )
+
+        await con.execute(
+            "UPDATE users SET balance=balance+? WHERE user_id=?",
+            (order[2], order[1])
+        )
+
+        await con.execute("""
+        INSERT INTO transactions(user_id,amount,reason)
+        VALUES(?,?,?)
+        """, (order[1], order[2], f"Rad etilgan buyurtma #{oid}"))
+
+        await con.commit()
+
+    await bot.send_message(
+        order[1],
+        f"❌ Buyurtma #{oid} rad etildi.\n"
+        f"{order[2]} Stars qaytarildi."
+    )
+
+    await message.answer("Stars qaytarildi.")
+
+
+# ==========================================
+# REYTING
+# ==========================================
+
+@dp.message(F.text == "🏆 Reyting")
+async def ranking(message: Message):
+    rows = await db("""
+    SELECT u.name, u.user_id, COUNT(r.invited) AS total
+    FROM users u
+    LEFT JOIN referrals r ON r.referrer=u.user_id
+    GROUP BY u.user_id
+    ORDER BY total DESC
+    LIMIT 10
+    """, all=True)
+
+    text = "🏆 <b>TOP REFERALLAR</b>\n\n"
+
+    for i, u in enumerate(rows, 1):
+        text += f"{i}. {u['name']} — {u['total']} ta\n"
+
+    await message.answer(text)
+
+
+# ==========================================
+# TARIX
+# ==========================================
+
+@dp.message(F.text == "📜 Tarix")
+async def history(message: Message):
+    rows = await db("""
+    SELECT * FROM transactions
+    WHERE user_id=?
+    ORDER BY id DESC LIMIT 20
+    """, (message.from_user.id,), all=True)
+
+    if not rows:
+        await message.answer("Hozircha operatsiyalar yo'q.")
+        return
+
+    text = "📜 <b>OPERATSIYALAR TARIXI</b>\n\n"
+
+    for r in rows:
+        text += (
+            f"⭐ {r['amount']:+} Stars\n"
+            f"Sabab: {r['reason']}\n"
+            f"Sana: {r['created']}\n\n"
+        )
+
+    await message.answer(text)
+
+
+# ==========================================
+# QO'LLANMA
+# ==========================================
 
 @dp.message(F.text == "📖 Qo'llanma")
 async def guide(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
-        return
     await message.answer(
-        "📖 <b>Qo'llanma</b>\n\n"
-        "1. 👥 Referal bo'limidan havolangizni oling.\n"
-        "2. Do'stlaringiz botni shu havola orqali ochsin.\n"
-        "3. Har bir tasdiqlangan referal uchun Stars olasiz.\n"
-        "4. 🎁 Gift yechish orqali mavjud sovg'alardan birini tanlang.\n"
-        "5. Buyurtma holatini «Mening buyurtmalarim»dan ko'ring.\n"
-        "6. Savollar uchun «Adminga murojaat» bo'limidan yozing.\n\n"
-        "Eslatma: bot bloklanishi yoki kanaldan chiqish aniqlansa, "
-        "mukofotlar bekor qilinishi mumkin. Bot chatni shunchaki "
-        "o'chirib tashlanganini har doim aniqlay olmaydi."
+        "📖 <b>BOT QO'LLANMASI</b>\n\n"
+        "1. Referal havolangizni oling.\n"
+        "2. Do'stlaringizni taklif qiling.\n"
+        "3. Har bir tasdiqlangan referal uchun Stars oling.\n"
+        "4. Gift tanlab buyurtma bering.\n"
+        "5. Buyurtmalaringizni kuzatib boring.\n"
+        "6. Savollar bo'lsa adminga murojaat qiling."
     )
 
 
-# ==================================================
-# 8. ADMIN BILAN YOZISHMA
-# ==================================================
-@dp.message(F.text == "💬 Adminga murojaat")
-async def contact_admin(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
+# ==========================================
+# ADMIN: STATISTIKA
+# ==========================================
+
+@dp.message(F.text == "📊 Statistika")
+async def statistics(message: Message):
+    if not admin(message.from_user.id):
         return
-    flows[message.from_user.id] = {"step": "contact"}
+
+    users = await db(
+        "SELECT COUNT(*) AS n FROM users", one=True
+    )
+    orders = await db(
+        "SELECT COUNT(*) AS n FROM orders", one=True
+    )
+    refs = await db(
+        "SELECT COUNT(*) AS n FROM referrals", one=True
+    )
+    pending = await db(
+        "SELECT COUNT(*) AS n FROM orders WHERE status='Kutilmoqda'",
+        one=True
+    )
+
     await message.answer(
-        "✍️ Adminga yubormoqchi bo'lgan xabaringizni yozing.\n"
-        "Bekor qilish uchun /cancel yuboring."
+        "📊 <b>BOT STATISTIKASI</b>\n\n"
+        f"👤 Foydalanuvchilar: {users['n']}\n"
+        f"👥 Referallar: {refs['n']}\n"
+        f"📦 Buyurtmalar: {orders['n']}\n"
+        f"⏳ Kutilayotgan: {pending['n']}"
+    )
+
+
+# ==========================================
+# ADMIN: FOYDALANUVCHILAR
+# ==========================================
+
+@dp.message(F.text == "👥 Foydalanuvchilar")
+async def users_list(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    users = await db(
+        "SELECT * FROM users ORDER BY joined DESC LIMIT 30",
+        all=True
+    )
+
+    for u in users:
+        await message.answer(
+            f"👤 {u['name']}\n"
+            f"ID: <code>{u['user_id']}</code>\n"
+            f"Balans: {u['balance']}\n"
+            f"Ban: {u['banned']}\n\n"
+            f"/ban {u['user_id']}\n"
+            f"/unban {u['user_id']}"
+        )
+
+
+@dp.message(Command("ban"))
+async def ban(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    if not command.args or not command.args.isdigit():
+        await message.answer("/ban USER_ID")
+        return
+
+    uid = int(command.args)
+
+    await db(
+        "UPDATE users SET banned=1 WHERE user_id=?",
+        (uid,)
+    )
+
+    await message.answer("⛔ Foydalanuvchi bloklandi.")
+
+
+@dp.message(Command("unban"))
+async def unban(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    if not command.args or not command.args.isdigit():
+        await message.answer("/unban USER_ID")
+        return
+
+    uid = int(command.args)
+
+    await db(
+        "UPDATE users SET banned=0 WHERE user_id=?",
+        (uid,)
+    )
+
+    await message.answer("✅ Ban olib tashlandi.")
+
+
+# ==========================================
+# ADMIN: BALANS
+# ==========================================
+
+@dp.message(F.text == "💳 Balans boshqaruvi")
+async def balance_admin(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    flows[message.from_user.id] = {"step": "balance"}
+
+    await message.answer(
+        "Quyidagi formatda yuboring:\n\n"
+        "<code>USER_ID AMOUNT</code>\n\n"
+        "Masalan: <code>123456789 20</code>\n"
+        "Manfiy son balansdan ayiradi."
+    )
+
+
+# ==========================================
+# ADMIN: REFERAL SOZLAMASI
+# ==========================================
+
+@dp.message(F.text == "⚙️ Referal sozlamasi")
+async def reward_admin(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    flows[message.from_user.id] = {"step": "reward"}
+
+    await message.answer(
+        f"Hozirgi mukofot: {await setting('referral_reward', '2')} Stars\n"
+        "Yangi mukofot miqdorini yuboring."
+    )
+
+
+# ==========================================
+# ADMIN: ID QIDIRISH
+# ==========================================
+
+@dp.message(F.text == "🔎 ID qidirish")
+async def search_admin(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    flows[message.from_user.id] = {"step": "search"}
+
+    await message.answer("Foydalanuvchi ID raqamini yuboring.")
+
+
+# ==========================================
+# ADMIN: KANALLAR
+# ==========================================
+
+@dp.message(F.text == "📡 Majburiy kanallar")
+async def channels_admin(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    rows = await db("SELECT * FROM channels", all=True)
+
+    text = "📡 <b>KANALLAR</b>\n\n"
+
+    for c in rows:
+        text += (
+            f"{c['username']} | "
+            f"Majburiy: {c['mandatory']} | "
+            f"Reklama: {c['ads']}\n"
+        )
+
+    text += (
+        "\n/addchannel @kanal\n"
+        "/delchannel @kanal"
+    )
+
+    await message.answer(text)
+
+
+@dp.message(Command("addchannel"))
+async def add_channel(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    username = (command.args or "").strip()
+
+    if not username.startswith("@"):
+        await message.answer("/addchannel @kanal")
+        return
+
+    try:
+        chat = await bot.get_chat(username)
+        member = await bot.get_chat_member(chat.id, bot.id)
+
+        if member.status != ChatMemberStatus.ADMINISTRATOR:
+            await message.answer("Bot kanal administratori bo'lishi kerak.")
+            return
+
+    except Exception:
+        await message.answer("Kanalni tekshirib bo'lmadi.")
+        return
+
+    await db("""
+    INSERT INTO channels(username,mandatory,ads)
+    VALUES(?,1,1)
+    ON CONFLICT(username) DO UPDATE SET mandatory=1
+    """, (username,))
+
+    await message.answer("✅ Kanal qo'shildi.")
+
+
+@dp.message(Command("delchannel"))
+async def del_channel(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    username = (command.args or "").strip()
+
+    await db(
+        "DELETE FROM channels WHERE username=?",
+        (username,)
+    )
+
+    await message.answer("Kanal o'chirildi.")
+
+
+# ==========================================
+# ADMIN: BROADCAST
+# ==========================================
+
+@dp.message(F.text == "📣 Hammaga xabar")
+async def broadcast_start(message: Message):
+    if not admin(message.from_user.id):
+        return
+
+    flows[message.from_user.id] = {"step": "broadcast"}
+
+    await message.answer(
+        "Yuboriladigan xabarni yuboring.\n"
+        "/cancel — bekor qilish"
     )
 
 
 @dp.message(Command("cancel"))
 async def cancel_flow(message: Message):
     flows.pop(message.from_user.id, None)
-    broadcasts.pop(message.from_user.id, None)
-    await message.answer("❌ Jarayon bekor qilindi.")
-
-
-# ==================================================
-# 9. GIFT BUYURTMASI
-# ==================================================
-@dp.message(F.text == "🎁 Gift yechish")
-async def gift_menu(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
-        return
-    user = await get_user(message.from_user.id)
-    await message.answer(
-        f"🎁 <b>Gift yechish</b>\n"
-        f"Balansingiz: <b>{user['balance']} Stars</b>\n\n"
-        "Kerakli giftni tanlang:",
-        reply_markup=gift_keyboard()
-    )
-
-
-@dp.callback_query(F.data.startswith("gift:"))
-async def choose_gift(callback: CallbackQuery):
-    if not await subscription_gate(callback, callback.from_user.id):
-        return
-    gift = int(callback.data.split(":")[1])
-    if gift not in GIFT_OPTIONS:
-        await callback.answer("Noto'g'ri tanlov.", show_alert=True)
-        return
-
-    user = await get_user(callback.from_user.id)
-    if user["balance"] < gift:
-        await callback.answer("Balansingiz yetarli emas!", show_alert=True)
-        return
-
-    flows[callback.from_user.id] = {
-        "step": "gift_confirm",
-        "gift": gift
-    }
-    await callback.message.answer(
-        f"🎁 Siz <b>{gift} gift</b> tanladingiz.\n\n"
-        "❓ <b>SIZ ROSTAN HAM SHUNI TANLAMOQCHIMISIZ?</b>\n\n"
-        f"Narxi: {gift} Stars\n"
-        f"Qoladigan balans: {user['balance'] - gift} Stars",
-        reply_markup=confirm_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "gift_confirm")
-async def confirm_gift(callback: CallbackQuery):
-    if not await subscription_gate(callback, callback.from_user.id):
-        return
-    data = flows.get(callback.from_user.id, {})
-    if data.get("step") != "gift_confirm":
-        await callback.answer("Buyurtma topilmadi.", show_alert=True)
-        return
-
-    gift = data["gift"]
-    user_id = callback.from_user.id
-    user = await get_user(user_id)
-
-    if user["balance"] < gift:
-        flows.pop(user_id, None)
-        await callback.answer("Balans yetarli emas.", show_alert=True)
-        return
-
-    # Balansdan mablag' buyurtma yaratilishi bilan yechiladi.
-    await query(
-        "UPDATE users SET balance=balance-? WHERE user_id=?",
-        (gift, user_id)
-    )
-    await query(
-        "INSERT INTO orders(user_id, gift) VALUES (?, ?)",
-        (user_id, gift)
-    )
-    order = await query(
-        "SELECT id FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1",
-        (user_id,), fetchone=True
-    )
-    flows.pop(user_id, None)
-
-    await bot.send_message(
-        ADMIN_ID,
-        f"🛒 <b>Yangi gift buyurtmasi!</b>\n"
-        f"Buyurtma: #{order['id']}\n"
-        f"Foydalanuvchi ID: <code>{user_id}</code>\n"
-        f"Gift: {gift}\n"
-        f"Holati: Kutilmoqda\n\n"
-        f"Buyurtmani boshqarish:\n"
-        f"/approve {order['id']}\n"
-        f"/reject {order['id']}"
-    )
-    await callback.message.answer(
-        f"✅ Buyurtma #{order['id']} qabul qilindi.\n"
-        "Admin ko'rib chiqqach, holatini buyurtmalar bo'limidan "
-        "tekshirishingiz mumkin.",
-        reply_markup=user_menu()
-    )
-    await callback.answer("Buyurtma yaratildi!")
-
-
-@dp.callback_query(F.data == "cancel")
-async def cancel_button(callback: CallbackQuery):
-    flows.pop(callback.from_user.id, None)
-    await callback.message.answer(
-        "❌ Bekor qilindi.", reply_markup=user_menu()
-    )
-    await callback.answer()
-
-
-@dp.message(F.text == "📦 Mening buyurtmalarim")
-async def my_orders(message: Message):
-    if not await subscription_gate(message, message.from_user.id):
-        return
-    orders = await query(
-        "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 30",
-        (message.from_user.id,), fetchall=True
-    )
-    if not orders:
-        await message.answer("Siz hali buyurtma bermagansiz.")
-        return
-    text = "📦 <b>Mening buyurtmalarim</b>\n\n"
-    for o in orders:
-        text += (
-            f"🧾 #{o['id']} — {o['gift']} gift\n"
-            f"Holati: {o['status']}\n"
-            f"Sana: {o['created_at']}\n\n"
-        )
-    await message.answer(text)
-
-
-# ==================================================
-# 10. ADMIN: BUYURTMALAR
-# ==================================================
-@dp.message(Command("approve"))
-async def approve_order(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Foydalanish: /approve BUYURTMA_ID")
-        return
-    order = await query(
-        "SELECT * FROM orders WHERE id=?", (int(parts[1]),),
-        fetchone=True
-    )
-    if not order:
-        await message.answer("Buyurtma topilmadi.")
-        return
-    if order["status"] != "Kutilmoqda":
-        await message.answer("Bu buyurtma oldin ko'rib chiqilgan.")
-        return
-    await query(
-        "UPDATE orders SET status='Tasdiqlandi' WHERE id=?",
-        (order["id"],)
-    )
-    await bot.send_message(
-        order["user_id"],
-        f"✅ #{order['id']} buyurtmangiz admin tomonidan tasdiqlandi."
-    )
-    await message.answer("Buyurtma tasdiqlandi.")
-
-
-@dp.message(Command("reject"))
-async def reject_order(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Foydalanish: /reject BUYURTMA_ID")
-        return
-    order = await query(
-        "SELECT * FROM orders WHERE id=?", (int(parts[1]),),
-        fetchone=True
-    )
-    if not order:
-        await message.answer("Buyurtma topilmadi.")
-        return
-    if order["status"] != "Kutilmoqda":
-        await message.answer("Bu buyurtma oldin ko'rib chiqilgan.")
-        return
-
-    # Rad etilsa, yechilgan Stars qaytariladi.
-    await query(
-        "UPDATE orders SET status='Rad etildi' WHERE id=?",
-        (order["id"],)
-    )
-    await query(
-        "UPDATE users SET balance=balance+? WHERE user_id=?",
-        (order["gift"], order["user_id"])
-    )
-    await bot.send_message(
-        order["user_id"],
-        f"❌ #{order['id']} buyurtmangiz rad etildi.\n"
-        f"{order['gift']} Stars balansingizga qaytarildi."
-    )
-    await message.answer("Buyurtma rad etildi, Stars qaytarildi.")
-
-
-@dp.message(F.text == "📦 Buyurtmalar")
-async def admin_orders(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    orders = await query(
-        "SELECT * FROM orders ORDER BY id DESC LIMIT 50",
-        fetchall=True
-    )
-    if not orders:
-        await message.answer("Hozircha buyurtmalar yo'q.")
-        return
-    for o in orders:
-        await message.answer(
-            f"🧾 Buyurtma #{o['id']}\n"
-            f"Foydalanuvchi: {o['user_id']}\n"
-            f"Gift: {o['gift']}\n"
-            f"Holati: {o['status']}\n"
-            f"Sana: {o['created_at']}\n\n"
-            f"Tasdiqlash: /approve {o['id']}\n"
-            f"Rad etish: /reject {o['id']}"
-        )
-
-
-# ==================================================
-# 11. ADMIN: BAN / UNBAN
-# ==================================================
-@dp.message(Command("ban"))
-async def ban_user(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    target = None
-    parts = (message.text or "").split()
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user.id
-    elif len(parts) == 2 and parts[1].isdigit():
-        target = int(parts[1])
-
-    if not target:
-        await message.answer(
-            "Foydalanish: foydalanuvchi xabariga reply qilib /ban "
-            "yoki /ban USER_ID"
-        )
-        return
-
-    await query(
-        "UPDATE users SET banned=1 WHERE user_id=?", (target,)
-    )
-    await message.answer(f"⛔ {target} ban qilindi.")
-
-
-@dp.message(Command("unban"))
-async def unban_user(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    target = None
-    parts = (message.text or "").split()
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user.id
-    elif len(parts) == 2 and parts[1].isdigit():
-        target = int(parts[1])
-
-    if not target:
-        await message.answer(
-            "Foydalanish: /unban USER_ID yoki xabarga reply qilib /unban"
-        )
-        return
-
-    await query(
-        "UPDATE users SET banned=0 WHERE user_id=?", (target,)
-    )
-    await message.answer(f"✅ {target} bandan chiqarildi.")
-
-
-# ==================================================
-# 12. ADMIN: FOYDALANUVCHILAR VA STATISTIKA
-# ==================================================
-@dp.message(F.text == "👤 Foydalanuvchilar")
-async def admin_users(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    users = await query(
-        "SELECT * FROM users ORDER BY joined_at DESC LIMIT 100",
-        fetchall=True
-    )
-    if not users:
-        await message.answer("Foydalanuvchilar yo'q.")
-        return
 
     await message.answer(
-        f"👤 Jami ro'yxatdagi foydalanuvchilar: "
-        f"{len(await query('SELECT user_id FROM users', fetchall=True))}\n"
-        "Ro'yxat 100 tadan ko'rsatiladi."
-    )
-    for u in users:
-        refs = await query(
-            "SELECT COUNT(*) AS n FROM referrals "
-            "WHERE referrer_id=? AND active=1",
-            (u["user_id"],), fetchone=True
-        )
-        await message.answer(
-            f"👤 {u['full_name']}\n"
-            f"Username: @{u['username'] or 'yoq'}\n"
-            f"ID: <code>{u['user_id']}</code>\n"
-            f"Balans: {u['balance']} Stars\n"
-            f"Faol referal: {refs['n']}\n"
-            f"Ban: {'Ha' if u['banned'] else 'Yo‘q'}\n"
-            f"Bloklangan deb belgilangan: "
-            f"{'Ha' if u['blocked'] else 'Yo‘q'}\n\n"
-            f"/ban {u['user_id']}  |  /unban {u['user_id']}"
-        )
-
-
-@dp.message(F.text == "📊 Statistika")
-async def stats(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    users = await query(
-        "SELECT COUNT(*) AS n FROM users", fetchone=True
-    )
-    banned = await query(
-        "SELECT COUNT(*) AS n FROM users WHERE banned=1", fetchone=True
-    )
-    orders = await query(
-        "SELECT COUNT(*) AS n FROM orders", fetchone=True
-    )
-    pending = await query(
-        "SELECT COUNT(*) AS n FROM orders WHERE status='Kutilmoqda'",
-        fetchone=True
-    )
-    refs = await query(
-        "SELECT COUNT(*) AS n FROM referrals WHERE active=1",
-        fetchone=True
-    )
-    await message.answer(
-        "📊 <b>Bot statistikasi</b>\n\n"
-        f"👤 Foydalanuvchilar: {users['n']}\n"
-        f"⛔ Ban qilinganlar: {banned['n']}\n"
-        f"👥 Faol referallar: {refs['n']}\n"
-        f"📦 Buyurtmalar: {orders['n']}\n"
-        f"⏳ Kutilayotgan buyurtmalar: {pending['n']}"
-    )
-
-
-@dp.message(F.text == "🔎 ID bo'yicha foydalanuvchi")
-async def lookup_prompt(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    flows[message.from_user.id] = {"step": "lookup"}
-    await message.answer("Foydalanuvchi ID raqamini yuboring.")
-
-
-# ==================================================
-# 13. ADMIN: REFERAL MUKOFOTI
-# ==================================================
-@dp.message(F.text == "⚙️ Referal mukofoti")
-async def reward_prompt(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    flows[message.from_user.id] = {"step": "reward"}
-    current = await get_setting("referral_reward", "5")
-    await message.answer(
-        f"Hozirgi mukofot: {current} Stars.\n"
-        "Har bir yangi referal uchun Stars sonini yuboring."
-    )
-
-
-# ==================================================
-# 14. ADMIN: MAJBURIY KANALLAR
-# ==================================================
-@dp.message(F.text == "📡 Majburiy kanallar")
-async def channel_panel(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    channels = await query("SELECT * FROM channels", fetchall=True)
-    text = "📡 <b>Kanallar</b>\n\n"
-    if channels:
-        for ch in channels:
-            text += (
-                f"{ch['username']} — "
-                f"majburiy: {'Ha' if ch['mandatory'] else 'Yo‘q'}, "
-                f"reklama: {'Ha' if ch['ads'] else 'Yo‘q'}\n"
-            )
-    else:
-        text += "Hozircha kanallar qo'shilmagan.\n"
-
-    await message.answer(
-        text +
-        "\nBuyruqlar:\n"
-        "/addchannel @kanal — qo'shish\n"
-        "/delchannel @kanal — o'chirish\n"
-        "/adson @kanal — reklamaga yoqish\n"
-        "/adsoff @kanal — reklamadan olish\n\n"
-        "Bot kanalga admin qilib qo'yilgan bo'lishi kerak."
-    )
-
-
-async def bot_is_channel_admin(username):
-    try:
-        chat = await bot.get_chat(username)
-        member = await bot.get_chat_member(chat.id, bot.id)
-        return member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR
-        )
-    except Exception:
-        return False
-
-
-@dp.message(Command("addchannel"))
-async def add_channel(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].startswith("@"):
-        await message.answer("Foydalanish: /addchannel @kanal_username")
-        return
-
-    username = parts[1]
-    if not await bot_is_channel_admin(username):
-        await message.answer("❌ U KANALDA BOT ADMIN EMAS.")
-        return
-
-    await query("""
-        INSERT INTO channels(username, mandatory, ads)
-        VALUES (?, 1, 1)
-        ON CONFLICT(username) DO UPDATE SET mandatory=1
-    """, (username,))
-    await message.answer(
-        f"✅ {username} majburiy kanal sifatida qo'shildi.\n"
-        "Reklama ham shu kanalga yuborishga yoqilgan."
-    )
-
-
-@dp.message(Command("delchannel"))
-async def del_channel(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await message.answer("Foydalanish: /delchannel @kanal_username")
-        return
-    await query("DELETE FROM channels WHERE username=?", (parts[1],))
-    await message.answer("Kanal ro'yxatdan o'chirildi.")
-
-
-@dp.message(Command("adson"))
-async def ads_on(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await message.answer("Foydalanish: /adson @kanal")
-        return
-    if not await bot_is_channel_admin(parts[1]):
-        await message.answer("❌ U KANALDA BOT ADMIN EMAS.")
-        return
-    await query(
-        "INSERT INTO channels(username, mandatory, ads) VALUES (?,0,1) "
-        "ON CONFLICT(username) DO UPDATE SET ads=1",
-        (parts[1],)
-    )
-    await message.answer("Kanal reklamalar uchun yoqildi.")
-
-
-@dp.message(Command("adsoff"))
-async def ads_off(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await message.answer("Foydalanish: /adsoff @kanal")
-        return
-    await query(
-        "UPDATE channels SET ads=0 WHERE username=?", (parts[1],)
-    )
-    await message.answer("Kanalga reklama yuborish o'chirildi.")
-
-
-# ==================================================
-# 15. ADMIN: XABARLAR VA REKLAMA
-# ==================================================
-@dp.message(F.text == "📣 Hammaga xabar")
-async def broadcast_start(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    broadcasts[message.from_user.id] = []
-    flows[message.from_user.id] = {"step": "broadcast"}
-    await message.answer(
-        "📣 Yuboriladigan matn, rasm, video yoki stikerni yuboring.\n"
-        "Bir nechta xabar ham yuborishingiz mumkin.\n"
-        "Yakunlash uchun /done, bekor qilish uchun /cancel."
-    )
-
-
-@dp.message(F.text == "📢 Kanallarga reklama")
-async def channel_ads_start(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    channels = await query(
-        "SELECT * FROM channels WHERE ads=1", fetchall=True
-    )
-    if not channels:
-        await message.answer(
-            "Reklama kanallari yo'q. Bot admin bo'lgan kanalni "
-            "/adson @kanal orqali qo'shing."
-        )
-        return
-    broadcasts[message.from_user.id] = []
-    flows[message.from_user.id] = {"step": "channel_ads"}
-    await message.answer(
-        "📢 Reklama uchun matn, rasm, video yoki stikerni yuboring.\n"
-        "Bir nechta xabar yuborishingiz mumkin.\n"
-        "/done — yuborish, /cancel — bekor qilish."
-    )
-
-
-@dp.message(Command("done"))
-async def finish_broadcast(message: Message):
-    admin_id = message.from_user.id
-    if not await is_admin(admin_id):
-        return
-    flow = flows.get(admin_id, {})
-    items = broadcasts.get(admin_id, [])
-    if flow.get("step") not in ("broadcast", "channel_ads"):
-        await message.answer("Faol reklama jarayoni yo'q.")
-        return
-    if not items:
-        await message.answer("Avval yuboriladigan xabarni kiriting.")
-        return
-
-    step = flow["step"]
-    sent = 0
-    failed = 0
-
-    if step == "broadcast":
-        users = await query(
-            "SELECT user_id FROM users WHERE banned=0", fetchall=True
-        )
-        for user in users:
-            for source_chat, source_msg in items:
-                try:
-                    await bot.copy_message(
-                        chat_id=user["user_id"],
-                        from_chat_id=source_chat,
-                        message_id=source_msg
-                    )
-                    sent += 1
-                except Exception:
-                    failed += 1
-                    # Bloklanganini taxmin qilish mumkin, lekin
-                    # shunchaki o'chirilgan chatni aniqlab bo'lmaydi.
-                    try:
-                        await query(
-                            "UPDATE users SET blocked=1 WHERE user_id=?",
-                            (user["user_id"],)
-                        )
-                    except Exception:
-                        pass
-
-    else:
-        channels = await query(
-            "SELECT username FROM channels WHERE ads=1",
-            fetchall=True
-        )
-        for ch in channels:
-            for source_chat, source_msg in items:
-                try:
-                    await bot.copy_message(
-                        chat_id=ch["username"],
-                        from_chat_id=source_chat,
-                        message_id=source_msg
-                    )
-                    sent += 1
-                except Exception:
-                    failed += 1
-
-    broadcasts.pop(admin_id, None)
-    flows.pop(admin_id, None)
-    await message.answer(
-        f"✅ Jarayon tugadi.\n"
-        f"Yuborilgan xabarlar: {sent}\n"
-        f"Yuborilmagan xabarlar: {failed}",
+        "Jarayon bekor qilindi.",
         reply_markup=admin_menu()
+        if admin(message.from_user.id)
+        else user_menu()
     )
 
 
-# ==================================================
-# 16. UMUMIY XABAR HANDLERI
-# ==================================================
+# ==========================================
+# ADMIN VA FOYDALANUVCHI XABARLARI
+# ==========================================
+
 @dp.message()
-async def general_handler(message: Message):
-    user_id = message.from_user.id
-    flow = flows.get(user_id, {})
+async def other_messages(message: Message):
+    uid = message.from_user.id
 
-    # Admin reply orqali foydalanuvchiga javob:
-    # bildirishnomadagi "Foydalanuvchi ID" satriga reply qiling.
-    if await is_admin(user_id) and message.reply_to_message:
-        replied = message.reply_to_message
-        source_text = replied.text or replied.caption or ""
-        match = re.search(r"Foydalanuvchi ID:\s*(\d+)", source_text)
-        if match and (message.text or "").startswith("/send "):
-            target = int(match.group(1))
-            answer_text = message.text[6:].strip()
-            try:
-                await bot.send_message(target, answer_text)
-                await message.answer("✅ Javob yuborildi.")
-            except Exception as e:
-                await message.answer(f"Xabar yuborilmadi: {e}")
-            return
-
-    # Admin reply bilan /ban va /unban komandalariga alohida handler bor.
-    if await is_admin(user_id) and flow.get("step") in (
-        "broadcast", "channel_ads"
-    ):
-        if message.text and message.text.startswith("/"):
-            return
-        broadcasts.setdefault(user_id, []).append(
-            (message.chat.id, message.message_id)
-        )
-        await message.answer(
-            f"✅ Xabar ro'yxatga olindi. Jami: "
-            f"{len(broadcasts[user_id])}\n"
-            "/done — tugatish va yuborish."
-        )
+    if not message.from_user:
         return
 
-    # Admin panelidagi ma'lumot kiritish jarayonlari
-    if await is_admin(user_id) and flow:
-        step = flow.get("step")
-
-        if step == "reward":
-            if not message.text or not message.text.isdigit():
-                await message.answer("Faqat 0 yoki undan katta butun son yuboring.")
-                return
-            await query("""
-                INSERT INTO settings(key,value) VALUES('referral_reward',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """, (message.text,))
-            flows.pop(user_id, None)
-            await message.answer(
-                f"✅ Referal mukofoti {message.text} Stars bo'ldi.",
-                reply_markup=admin_menu()
-            )
-            return
-
-        if step == "lookup":
-            if not message.text or not message.text.isdigit():
-                await message.answer("Raqamli foydalanuvchi ID yuboring.")
-                return
-            target = int(message.text)
-            user = await get_user(target)
-            flows.pop(user_id, None)
-            if not user:
-                await message.answer("Foydalanuvchi bazada topilmadi.")
-                return
-            refs = await query(
-                "SELECT COUNT(*) AS n FROM referrals "
-                "WHERE referrer_id=? AND active=1",
-                (target,), fetchone=True
-            )
-            await message.answer(
-                f"👤 {user['full_name']}\n"
-                f"ID: {target}\n"
-                f"Username: @{user['username'] or 'yoq'}\n"
-                f"Balans: {user['balance']} Stars\n"
-                f"Faol referallar: {refs['n']}\n"
-                f"Ban: {user['banned']}\n"
-                f"/ban {target} | /unban {target}"
-            )
-            return
-
-    # Foydalanuvchi adminga murojaat yuboryapti
-    if flow.get("step") == "contact":
-        try:
-            name = message.from_user.full_name
-            username = (
-                "@" + message.from_user.username
-                if message.from_user.username else "yo'q"
-            )
-            await bot.send_message(
-                ADMIN_ID,
-                f"📩 <b>Yangi murojaat</b>\n"
-                f"Ism: {name}\n"
-                f"Username: {username}\n"
-                f"Foydalanuvchi ID: {user_id}\n"
-                f"Javob berish: xabarga reply qilib "
-                f"<code>/send matn</code> yozing."
-            )
-            await bot.copy_message(
-                chat_id=ADMIN_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-            flows.pop(user_id, None)
-            await message.answer(
-                "✅ Xabaringiz adminga yuborildi.",
-                reply_markup=user_menu()
-            )
-        except Exception:
-            await message.answer("Xabarni yuborib bo'lmadi. Keyinroq urinib ko'ring.")
-        return
-
-    # Boshqa barcha oddiy xabarlar uchun tekshiruv
-    user = await get_user(user_id)
-    if user and user["banned"]:
-        await message.answer("⛔ Siz botdan foydalanishdan cheklangansiz.")
-        return
+    user = await get_user(uid)
 
     if not user:
-        await register_user(message.from_user)
+        await register(message.from_user)
+        user = await get_user(uid)
 
-    if not await subscription_gate(message, user_id):
+    if user and user["banned"]:
+        await message.answer("⛔ Siz bloklangansiz.")
         return
 
-    if await is_admin(user_id):
+    flow = flows.get(uid, {})
+
+    if flow.get("step") == "reward" and admin(uid):
+        if not message.text or not message.text.isdigit():
+            await message.answer("Faqat musbat son yuboring.")
+            return
+
+        amount = int(message.text)
+
+        if amount < 1 or amount > 100000:
+            await message.answer("1 dan 100000 gacha son kiriting.")
+            return
+
+        await db("""
+        INSERT INTO settings(key,value)
+        VALUES('referral_reward',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (str(amount),))
+
+        flows.pop(uid, None)
+        await message.answer(f"✅ Referal mukofoti {amount} Stars bo'ldi.")
+        return
+
+    if flow.get("step") == "balance" and admin(uid):
+        try:
+            target, amount = map(int, message.text.split())
+        except Exception:
+            await message.answer("USER_ID AMOUNT formatida yuboring.")
+            return
+
+        if not await get_user(target):
+            await message.answer("Foydalanuvchi topilmadi.")
+            return
+
+        async with aiosqlite.connect(DB_NAME) as con:
+            await con.execute("BEGIN IMMEDIATE")
+
+            cur = await con.execute(
+                "SELECT balance FROM users WHERE user_id=?",
+                (target,)
+            )
+            row = await cur.fetchone()
+
+            if row[0] + amount < 0:
+                await con.rollback()
+                await message.answer("Balans manfiy bo'lib qoladi.")
+                return
+
+            await con.execute(
+                "UPDATE users SET balance=balance+? WHERE user_id=?",
+                (amount, target)
+            )
+
+            await con.execute("""
+            INSERT INTO transactions(user_id,amount,reason)
+            VALUES(?,?,?)
+            """, (target, amount, "Admin balans o'zgarishi"))
+
+            await con.commit()
+
+        flows.pop(uid, None)
+
+        await bot.send_message(
+            target,
+            f"💰 Balansingiz {amount:+} Stars ga o'zgartirildi."
+        )
+
+        await message.answer("Balans yangilandi.")
+        return
+
+    if flow.get("step") == "search" and admin(uid):
+        if not message.text or not message.text.isdigit():
+            await message.answer("ID raqamini yuboring.")
+            return
+
+        target = await get_user(int(message.text))
+        flows.pop(uid, None)
+
+        if not target:
+            await message.answer("Foydalanuvchi topilmadi.")
+            return
+
         await message.answer(
-            "Admin panelidan kerakli bo'limni tanlang.",
+            f"👤 {target['name']}\n"
+            f"ID: {target['user_id']}\n"
+            f"Balans: {target['balance']}\n"
+            f"Ban: {target['banned']}"
+        )
+        return
+
+    if flow.get("step") == "broadcast" and admin(uid):
+        users = await db(
+            "SELECT user_id FROM users WHERE banned=0",
+            all=True
+        )
+
+        sent = 0
+        failed = 0
+
+        for u in users:
+            try:
+                await bot.copy_message(
+                    chat_id=u["user_id"],
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+
+            await asyncio.sleep(0.04)
+
+        flows.pop(uid, None)
+
+        await message.answer(
+            f"📣 Tarqatish yakunlandi.\n"
+            f"Yuborildi: {sent}\n"
+            f"Xatolik: {failed}",
             reply_markup=admin_menu()
         )
-    else:
+        return
+
+    if flow.get("step") == "contact":
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"📩 Yangi murojaat\n"
+                f"Ism: {message.from_user.full_name}\n"
+                f"ID: {uid}"
+            )
+
+            await bot.copy_message(
+                ADMIN_ID,
+                message.chat.id,
+                message.message_id
+            )
+
+            flows.pop(uid, None)
+
+            await message.answer(
+                "✅ Murojaatingiz yuborildi.",
+                reply_markup=user_menu()
+            )
+
+        except Exception:
+            await message.answer("Xabar yuborilmadi.")
+        return
+
+    if not await check_subscription(message, uid):
+        return
+
+    await message.answer(
+        "Kerakli bo'limni menyudan tanlang.",
+        reply_markup=admin_menu() if admin(uid) else user_menu()
+    )
+
+
+# ==========================================
+# ADMIN: MUROJAATLARGA JAVOB
+# ==========================================
+
+@dp.message(Command("reply"))
+async def reply_user(message: Message, command: CommandObject):
+    if not admin(message.from_user.id):
+        return
+
+    try:
+        parts = (command.args or "").split(maxsplit=1)
+        target = int(parts[0])
+        text = parts[1]
+    except Exception:
         await message.answer(
-            "Menyudagi tugmalardan foydalaning.",
-            reply_markup=user_menu()
+            "Foydalanish: /reply USER_ID xabar"
         )
-
-
-# ==================================================
-# 17. REFERAL MUKOFOTINI BERISH
-# ==================================================
-async def award_pending_referral(user_id):
-    user = await get_user(user_id)
-    if not user or not user["referrer_id"]:
         return
 
-    referrer_id = user["referrer_id"]
-    existing = await query(
-        "SELECT * FROM referrals WHERE invited_id=?",
-        (user_id,), fetchone=True
-    )
-    if existing:
+    try:
+        await bot.send_message(
+            target,
+            "📩 <b>Admin javobi:</b>\n\n" + text
+        )
+        await message.answer("Javob yuborildi.")
+    except Exception:
+        await message.answer("Xabarni yuborib bo'lmadi.")
+
+
+# ==========================================
+# FOYDALANUVCHI PANELIGA QAYTISH
+# ==========================================
+
+@dp.message(F.text == "⬅️ Foydalanuvchi paneli")
+async def back_user(message: Message):
+    if not admin(message.from_user.id):
         return
 
-    # Taklif qilingan foydalanuvchi kanallarga obuna bo'lgandagina
-    # referalni faollashtiramiz.
-    if await missing_channels(user_id):
+    await message.answer(
+        "Foydalanuvchi paneli.",
+        reply_markup=user_menu()
+    )
+
+
+@dp.message(F.text == "💬 Adminga murojaat")
+async def contact_start(message: Message):
+    if not await check_subscription(message, message.from_user.id):
         return
 
-    reward = int(await get_setting("referral_reward", "5"))
-    await query(
-        "INSERT OR IGNORE INTO referrals(invited_id,referrer_id,reward,active) "
-        "VALUES(?,?,?,1)",
-        (user_id, referrer_id, reward)
-    )
-    await query(
-        "UPDATE users SET balance=balance+? WHERE user_id=?",
-        (reward, referrer_id)
-    )
-    await bot.send_message(
-        referrer_id,
-        f"🎉 Yangi referal tasdiqlandi!\n+{reward} Stars"
+    flows[message.from_user.id] = {"step": "contact"}
+
+    await message.answer(
+        "✍️ Xabaringizni yuboring.\n"
+        "/cancel — bekor qilish"
     )
 
 
-# ==================================================
-# 18. POLLING
-# ==================================================
+# ==========================================
+# HTTP SERVER — RENDER
+# ==========================================
+
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "telegram-bot"
+    })
+
+
 async def main():
-    if BOT_TOKEN == "BOT_TOKENINGIZNI_BU_YERGA_YOZING":
-        raise RuntimeError("BOT_TOKEN qatoriga bot tokenini kiriting.")
-
     await init_db()
 
-    # Telegram'dagi mavjud foydalanuvchilarning /start so'rovlari
-    # va obuna tekshiruvi paytida mukofot beriladi.
-    # Eski foydalanuvchilar uchun takroriy mukofot berilmaydi.
-    await dp.start_polling(bot)
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
+    await site.start()
+
+    logging.info("HTTP server ishga tushdi: %s", PORT)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
