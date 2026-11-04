@@ -20,8 +20,8 @@ from aiogram.types import (
 # SOZLAMALAR
 # ==========================================
 
-BOT_TOKEN = os.getenv("9218262379:AAFsjhnY240_g_rxQrF8IXwvX9KkZNdMXao", "9218262379:AAFsjhnY240_g_rxQrF8IXwvX9KkZNdMXao")
-ADMIN_ID = int(os.getenv("5200398952", "5200398952"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9218262379:AAFsjhnY240_g_rxQrF8IXwvX9KkZNdMXao")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5200398952"))
 DB_NAME = "bot_database.db"
 PORT = int(os.getenv("PORT", "10000"))
 
