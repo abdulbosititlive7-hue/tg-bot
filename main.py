@@ -236,7 +236,7 @@ def gifts_keyboard():
                 callback_data="cancel"
             )
         ]]
-    ])
+    )
 
 
 # ==========================================
